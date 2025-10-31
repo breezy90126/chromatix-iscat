@@ -219,13 +219,16 @@ class Field(eqx.Module, strict=_strict_config):
         return self.dx * jnp.asarray(self.spatial_shape)
 
     @property
-    def spatial_limits(self) -> tuple[tuple[float, float], tuple[float, float]]:
+    def spatial_limits(self) -> Float[Array, "2 2"]:
         """
-        Return the spatial limits of the field: (y_min, y_max), (x_min, x_max).
+        Return the spatial limits of the field as a `(2 2)`-shaped array of the
+        format [[y_min, y_max], [x_min, x_max]].
         """
-        return (float(self.grid[..., 0].min()), float(self.grid[..., 0].max())), (
-            float(self.grid[..., 1].min()),
-            float(self.grid[..., 1].max()),
+        return jnp.array(
+            [
+                [self.grid[..., 0].min(), self.grid[..., 0].max()],
+                [self.grid[..., 1].min(), self.grid[..., 1].max()],
+            ]
         )
 
     @property
