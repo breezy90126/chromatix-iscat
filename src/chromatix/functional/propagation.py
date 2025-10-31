@@ -454,11 +454,11 @@ def kernel_propagate(
                 axis=-1,
             )
             u = mod_terms * fftconvolve(B, f, mode="same", axes=axes)
-
+    field = field.replace(u=u)
     if absorbing_boundary is not None:
         pupil = _boundaries[absorbing_boundary]
         field = pupil(field, absorbing_boundary_width)
-    return field.replace(u=u)
+    return field
 
 
 def compute_transfer_propagator(
