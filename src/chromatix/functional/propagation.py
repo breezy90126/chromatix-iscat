@@ -457,6 +457,7 @@ def kernel_propagate(
     field = field.replace(u=u)
     if absorbing_boundary is not None:
         pupil = _boundaries[absorbing_boundary]
+        absorbing_boundary_width *= field.extent[1]
         field = pupil(field, absorbing_boundary_width)
     return field
 
