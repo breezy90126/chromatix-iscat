@@ -311,8 +311,10 @@ def asm_propagate(
             Shimobaba. Defaults to ``False``.
         shift_yx: If provided, defines a shift in the destination
             plane. Should be an array of shape `[2,]` in the format `[y, x]`.
-        output_dx: If provided, defines a different output sampling at the output
-            plane.
+        output_dx: If provided, defines a different output sampling at the
+            output plane. Must be of the same shape as that of ``field.dx``.
+            For example, you could construct this as ``field.dx / zoom_factor``
+            where ``zoom_factor`` is how much you want to zoom in.
         output_shape: If provided, defines the output shape of the field. Should be
             a tuple of integers. If not provided and ``dx`` is provided, the
             output shape will default to that of the input field.
@@ -403,27 +405,25 @@ def kernel_propagate(
         in_field_extent = field.extent.squeeze()
         field = shift_grid(field, shift_yx)
         field = Field.empty_like(field, dx=output_dx, shape=output_shape)
-
         # Scaling factor in Eq 7 of "Band-limited angular spectrum numerical
         # propagation method with selective scaling of observation window size
         # and sample number"
         alpha = field.dx / in_field_df
-
-        # output field in k-space
-        # u = fft(in_field, axes=axes, shift=True) * jnp.fft.fftshift(propagator, axes=axes)
+        # Output field in k-space
         u = jnp.fft.fftshift(
             propagator
             * jnp.fft.fft2(jnp.fft.ifftshift(in_field, axes=axes), axes=axes),
             axes=axes,
         )
-
         if use_czt:
-            (y_min, y_max), (x_min, x_max) = field.spatial_limits
+            spatial_limits = field.spatial_limits
+            y_min = spatial_limits[0, 0]
+            y_max = spatial_limits[0, 1]
+            x_min = spatial_limits[1, 0]
+            x_max = spatial_limits[1, 1]
             limits_min = [y_min, x_min]
             limits_max = [y_max, x_max]
             T = in_field_extent
-
-            # loop over dimensions
             for d in range(len(axes)):
                 # -- chirp z-transform
                 m = output_shape[d]
@@ -432,7 +432,6 @@ def kernel_propagate(
                     1j * (2 * jnp.pi / T[d]) * (limits_max[d] - limits_min[d]) / (m - 1)
                 )
                 u = czt(x=u, m=m, a=a, w=w, axis=axes[d])
-
                 # -- modulate
                 N = (m - 1) // 2
                 u = jnp.moveaxis(u, axes[d], -1)
@@ -441,7 +440,6 @@ def kernel_propagate(
                 u = jnp.moveaxis(u, -1, axes[d])
 
             u *= jnp.prod(1 / alpha)
-
         else:
             # Eq 9 of "Band-limited angular spectrum numerical propagation method
             # with selective scaling of observation window size and sample number"
