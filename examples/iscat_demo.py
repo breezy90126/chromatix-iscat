@@ -118,7 +118,7 @@ fitted, losses = fit_particles(
     gain=0.0,
     read_var=1.0,
     n_steps=50,
-    lr=1e-6,
+    lr=1e-9,
     call_kwargs={"shape": SHAPE, "dx": DX},
 )
 

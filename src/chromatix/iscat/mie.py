@@ -58,8 +58,9 @@ def mie_coefficients(m, x, n_max: int):
 
     psi_prev = jnp.sin(x)
     psi_curr = jnp.sin(x) / x - jnp.cos(x)
-    chi_prev = -jnp.cos(x)
-    chi_curr = -jnp.cos(x) / x - jnp.sin(x)
+    # B&H convention: chi_n = -x * y_n(x), so chi_0=cos(x), chi_1=cos(x)/x+sin(x)
+    chi_prev = jnp.cos(x)
+    chi_curr = jnp.cos(x) / x + jnp.sin(x)
 
     def body(carry, n):
         psi_nm1, psi_n, chi_nm1, chi_n = carry
