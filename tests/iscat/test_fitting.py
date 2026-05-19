@@ -49,7 +49,7 @@ def test_fitting_reduces_loss():
         gain=0.0,
         read_var=1.0,
         n_steps=50,
-        lr=1e-8,
+        lr=1e-6,
         call_kwargs={"shape": SHAPE, "dx": DX},
     )
 
@@ -70,7 +70,7 @@ def test_fitting_returns_correct_shapes():
         gain=0.0,
         read_var=1.0,
         n_steps=5,
-        lr=1e-9,
+        lr=1e-6,
         call_kwargs={"shape": SHAPE, "dx": DX},
     )
 

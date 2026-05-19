@@ -95,31 +95,33 @@ class iSCATMicroscope(eqx.Module):
         self.sensor = sensor
 
     def _scatter_one_particle(self, incident_field, radius, m, pos_yx, z_p):
-        """Compute scattered field for a single particle."""
-        # Shift pupil by lateral position
-        dy, dx_p = pos_yx[0], pos_yx[1]
-        shifted = shift_pupil(incident_field, dy, dx_p)
+        """Compute scattered field for a single particle.
 
-        # Apply aberration phase
+        Particle lateral position is encoded as a phase factor exp(-2j*pi*(fy*dy+fx*dx))
+        via the FT shift theorem — applied AFTER scattering so it is not cancelled.
+        """
+        dy, dx_p = pos_yx[0], pos_yx[1]
+
+        # Apply aberration phase for this particle's axial position
         ab_phase = index_mismatch_phase(
-            shifted,
+            incident_field,
             self.na,
             self.n_oil,
             self.n_medium,
             self.wavelength,
-            float(self.z_focal),
+            self.z_focal,
             self.t_oil_ideal,
             z_particle=z_p,
         )
-        shifted = shifted.replace(u=shifted.u * jnp.exp(1j * ab_phase))
+        field = incident_field.replace(u=incident_field.u * jnp.exp(1j * ab_phase))
 
-        # Apply scattering
+        # Apply scattering amplitude (Mie or Rayleigh)
         if self.scattering_model == "mie":
-            scattered = apply_mie_pupil(shifted, radius, m, self.n_medium, self.n_max)
+            scattered = apply_mie_pupil(field, radius, m, self.n_medium, self.n_max)
         else:
-            scattered = apply_rayleigh_pupil(shifted, radius, m, self.n_medium)
+            scattered = apply_rayleigh_pupil(field, radius, m, self.n_medium)
 
-        # Shift back
+        # Encode lateral position: FT shift theorem — exp(-2j*pi*(fy*dy + fx*dx))
         return shift_pupil(scattered, -dy, -dx_p)
 
     def __call__(
@@ -150,9 +152,8 @@ class iSCATMicroscope(eqx.Module):
         if theta_inc != 0.0:
             incident = oblique_phase(incident, theta_inc, phi_inc, self.n_medium)
 
-        # Propagate to focal plane
-        if float(self.z_focal) != 0.0:
-            incident = asm_propagate(incident, float(self.z_focal), self.n_medium, pad_width, mode="same")
+        # Propagate to focal plane (z_focal=0 is a no-op but JAX-traceable)
+        incident = asm_propagate(incident, self.z_focal, self.n_medium, pad_width, mode="same")
 
         # Sum scattered fields from all particles
         n_particles = self.radii.shape[0]

@@ -2,7 +2,6 @@
 
 import jax
 import jax.numpy as jnp
-from functools import partial
 
 
 def default_n_max(x: float) -> int:
@@ -31,13 +30,9 @@ def _log_derivative_downward(m, x, n_max: int):
         D_curr = (n + 1) / mx - 1.0 / (D_next + (n + 1) / mx)
         return D_curr, D_curr
 
-    D_init = jnp.zeros((), dtype=jnp.complex64) + 0j
-    _, D_all = jax.lax.scan(body, D_init, jnp.arange(n_start - 1, 0, -1, dtype=jnp.float32))
-    # D_all[i] corresponds to D_{n_start - i}, length n_start-1
-    # We need D_1 .. D_n_max: these are at indices n_start-2 .. n_start-n_max-1 (reversed)
-    # After scan from n_start-1 down to 1:
-    # D_all[0] = D_{n_start-1}, D_all[1] = D_{n_start-2}, ...
-    # D_n corresponds to D_all[n_start - 1 - n]
+    # Use same complex dtype as mx (respects x64 when enabled)
+    D_init = jnp.zeros((), dtype=mx.dtype)
+    _, D_all = jax.lax.scan(body, D_init, jnp.arange(n_start - 1, 0, -1, dtype=jnp.int32))
     indices = n_start - 1 - jnp.arange(1, n_max + 1)
     return D_all[indices]
 
@@ -53,15 +48,13 @@ def mie_coefficients(m, x, n_max: int):
     Returns:
         a_n, b_n: arrays of shape (n_max,)
     """
-    x = jnp.asarray(x, dtype=jnp.float32)
-    m = jnp.asarray(m, dtype=jnp.complex64)
+    # Preserve caller's dtype; float32 outside x64 mode, float64 inside
+    x = jnp.asarray(x)
+    m = jnp.asarray(m)
+    if not jnp.issubdtype(m.dtype, jnp.complexfloating):
+        m = m.astype(jnp.complex64 if x.dtype == jnp.float32 else jnp.complex128)
 
     D = _log_derivative_downward(m, x, n_max)  # shape (n_max,)
-
-    # Upward scan for Riccati-Bessel psi_n and xi_n
-    # psi_0 = sin(x), psi_1 = sin(x)/x - cos(x)
-    # xi_n = psi_n - i * chi_n
-    ns = jnp.arange(1, n_max + 1, dtype=jnp.float32)
 
     psi_prev = jnp.sin(x)
     psi_curr = jnp.sin(x) / x - jnp.cos(x)
@@ -70,10 +63,11 @@ def mie_coefficients(m, x, n_max: int):
 
     def body(carry, n):
         psi_nm1, psi_n, chi_nm1, chi_n = carry
+        n = n.astype(x.dtype)
         psi_np1 = (2 * n + 1) / x * psi_n - psi_nm1
         chi_np1 = (2 * n + 1) / x * chi_n - chi_nm1
         xi_n = psi_n - 1j * chi_n
-        D_n = D[n - 1]
+        D_n = D[n.astype(jnp.int32) - 1]
         a_n = (D_n / m + n / x) * psi_n - psi_nm1
         a_n = a_n / ((D_n / m + n / x) * xi_n - (psi_nm1 - 1j * chi_nm1))
         b_n = (m * D_n + n / x) * psi_n - psi_nm1
@@ -82,7 +76,7 @@ def mie_coefficients(m, x, n_max: int):
 
     init = (psi_prev, psi_curr, chi_prev, chi_curr)
     _, (a_n, b_n) = jax.lax.scan(body, init, jnp.arange(1, n_max + 1, dtype=jnp.int32))
-    return a_n.astype(jnp.complex64), b_n.astype(jnp.complex64)
+    return a_n, b_n
 
 
 def _pi_tau(u, n_max: int):
@@ -90,18 +84,15 @@ def _pi_tau(u, n_max: int):
 
     Returns pi_n, tau_n each of shape (n_max,).
     """
-    # pi_0 = 0, pi_1 = 1
-    # pi_{n+1} = ((2n+1)*u*pi_n - (n+1)*pi_{n-1}) / n
-    # tau_n = n * u * pi_n - (n+1) * pi_{n-1}
-
     def body(carry, n):
         pi_nm1, pi_n = carry
+        n = n.astype(u.dtype)
         pi_np1 = ((2 * n + 1) * u * pi_n - (n + 1) * pi_nm1) / n
         tau_n = n * u * pi_n - (n + 1) * pi_nm1
         return (pi_n, pi_np1), (pi_n, tau_n)
 
     init = (jnp.zeros_like(u), jnp.ones_like(u))
-    _, (pi_ns, tau_ns) = jax.lax.scan(body, init, jnp.arange(1, n_max + 1, dtype=jnp.float32))
+    _, (pi_ns, tau_ns) = jax.lax.scan(body, init, jnp.arange(1, n_max + 1, dtype=jnp.int32))
     return pi_ns, tau_ns
 
 
@@ -122,7 +113,7 @@ def s1_s2(theta, a_n, b_n):
 
     def single(ui):
         pi_ns, tau_ns = _pi_tau(ui, n_max)
-        ns = jnp.arange(1, n_max + 1, dtype=jnp.float32)
+        ns = jnp.arange(1, n_max + 1, dtype=a_n.real.dtype)
         w = (2 * ns + 1) / (ns * (ns + 1))
         s1 = jnp.sum(w * (a_n * pi_ns + b_n * tau_ns))
         s2 = jnp.sum(w * (a_n * tau_ns + b_n * pi_ns))
