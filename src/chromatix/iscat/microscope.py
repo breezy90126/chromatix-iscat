@@ -1,43 +1,26 @@
-"""iSCAT microscope forward model."""
+"""iSCAT microscope forward model — pupil-plane formulation.
 
-from typing import Optional, Sequence
+Physics:
+  E_sc(y,x) = IFFT[ S(ky,kx) · P(ky,kx) · exp(-2πi·(fy·dy+fx·dx)) · exp(i·kz·dz) ]
+  E_ref      = r_Fresnel · reference_amplitude   (uniform)
+  I(y,x)    = |E_ref + E_sc(y,x)|²
+
+Working entirely in the Fourier/pupil domain and transforming to the image
+plane with a single IFFT avoids the confusion of applying pupil-plane
+operations to a real-space field.
+"""
+
+from typing import Optional
 import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-from chromatix.functional.sources import plane_wave
-from chromatix.functional.propagation import asm_propagate
-
-from .scattering import apply_mie_pupil, apply_rayleigh_pupil, shift_pupil
-from .illumination import oblique_phase, fresnel_reference
+from .mie import mie_coefficients, s1_s2, default_n_max
 from .background import psd_background_phase
-from .aberration import index_mismatch_phase
-
-
-def _na_cutoff(field, na: float):
-    """Apply hard NA mask via FFT/IFFT."""
-    from chromatix.core import VectorField
-    wavelength = field.spectrum.central_wavelength
-    fy = field.f_grid[..., 0, 0]
-    fx = field.f_grid[..., 0, 1]
-    f_norm = jnp.sqrt(fy ** 2 + fx ** 2)
-    mask = (f_norm <= na / wavelength).astype(jnp.float32)
-    # Apply mask in frequency domain
-    u_fft = jnp.fft.fft2(field.u, axes=(0, 1))
-    u_fft_shifted = jnp.fft.fftshift(u_fft, axes=(0, 1))
-    u_fft_masked = u_fft_shifted * mask[..., jnp.newaxis]
-    u_fft_back = jnp.fft.ifftshift(u_fft_masked, axes=(0, 1))
-    u_filtered = jnp.fft.ifft2(u_fft_back, axes=(0, 1))
-    return field.replace(u=u_filtered)
 
 
 class iSCATMicroscope(eqx.Module):
-    """iSCAT forward model as an Equinox module.
-
-    Trainable parameters: radii, n_particles, positions_yx, z_particles, z_focal.
-    Static parameters: na, n_oil, n_glass, n_medium, wavelength, t_oil_ideal,
-                       scattering_model, n_max, reference_amplitude, sensor.
-    """
+    """iSCAT forward model — pupil-plane IFFT formulation."""
 
     # Trainable arrays
     radii: jax.Array
@@ -72,7 +55,7 @@ class iSCATMicroscope(eqx.Module):
         n_medium: float = 1.33,
         wavelength: float = 532e-9,
         t_oil_ideal: float = 170e-6,
-        scattering_model: str = "mie",
+        scattering_model: str = "rayleigh",
         n_max: Optional[int] = None,
         reference_amplitude: float = 1.0,
         sensor=None,
@@ -82,7 +65,6 @@ class iSCATMicroscope(eqx.Module):
         self.positions_yx = jnp.asarray(positions_yx, dtype=jnp.float32)
         self.z_particles = jnp.asarray(z_particles, dtype=jnp.float32)
         self.z_focal = jnp.asarray(z_focal, dtype=jnp.float32)
-
         self.na = na
         self.n_oil = n_oil
         self.n_glass = n_glass
@@ -94,36 +76,6 @@ class iSCATMicroscope(eqx.Module):
         self.reference_amplitude = reference_amplitude
         self.sensor = sensor
 
-    def _scatter_one_particle(self, incident_field, radius, m, pos_yx, z_p):
-        """Compute scattered field for a single particle.
-
-        Particle lateral position is encoded as a phase factor exp(-2j*pi*(fy*dy+fx*dx))
-        via the FT shift theorem — applied AFTER scattering so it is not cancelled.
-        """
-        dy, dx_p = pos_yx[0], pos_yx[1]
-
-        # Apply aberration phase for this particle's axial position
-        ab_phase = index_mismatch_phase(
-            incident_field,
-            self.na,
-            self.n_oil,
-            self.n_medium,
-            self.wavelength,
-            self.z_focal,
-            self.t_oil_ideal,
-            z_particle=z_p,
-        )
-        field = incident_field.replace(u=incident_field.u * jnp.exp(1j * ab_phase))
-
-        # Apply scattering amplitude (Mie or Rayleigh)
-        if self.scattering_model == "mie":
-            scattered = apply_mie_pupil(field, radius, m, self.n_medium, self.n_max)
-        else:
-            scattered = apply_rayleigh_pupil(field, radius, m, self.n_medium)
-
-        # Encode lateral position: FT shift theorem — exp(-2j*pi*(fy*dy + fx*dx))
-        return shift_pupil(scattered, -dy, -dx_p)
-
     def __call__(
         self,
         key=None,
@@ -134,62 +86,93 @@ class iSCATMicroscope(eqx.Module):
         include_background: bool = False,
         pad_width: int = 0,
     ):
-        """Simulate iSCAT image.
+        """Simulate iSCAT image intensity of shape (ny, nx).
 
-        Returns intensity image of shape (y, x).
+        Pupil-plane formulation:
+          1. Build frequency grid (DC at centre, fftshifted convention).
+          2. For each particle: compute pupil field = S(theta) * P * defocus * pos_phase.
+          3. Sum pupils, IFFT → scattered field at image plane.
+          4. Add uniform Fresnel reference.
+          5. I = |E_ref + E_sc|².
         """
-        # Build incident plane wave (vectorial, x-polarised)
-        incident = plane_wave(
-            shape=shape,
-            dx=dx,
-            spectrum=self.wavelength,
-            amplitude=jnp.array([0.0, 0.0, 1.0]),  # x-polarised
-            scalar=False,
-            power=None,
-        )
+        ny, nx = shape
 
-        # Apply oblique illumination
-        if theta_inc != 0.0:
-            incident = oblique_phase(incident, theta_inc, phi_inc, self.n_medium)
+        # ── Pupil frequency grid (cycles/m), DC at centre ─────────────────────
+        fy_1d = jnp.fft.fftshift(jnp.fft.fftfreq(ny, d=dx))
+        fx_1d = jnp.fft.fftshift(jnp.fft.fftfreq(nx, d=dx))
+        FY, FX = jnp.meshgrid(fy_1d, fx_1d, indexing="ij")  # (ny, nx)
 
-        # Propagate to focal plane (z_focal=0 is a no-op but JAX-traceable)
-        incident = asm_propagate(incident, self.z_focal, self.n_medium, pad_width, mode="same")
+        f2 = FY ** 2 + FX ** 2
+        f_na = self.na / self.wavelength
+        na_mask = (f2 <= f_na ** 2).astype(jnp.float32)
 
-        # Sum scattered fields from all particles
-        n_particles = self.radii.shape[0]
+        k_med = 2.0 * jnp.pi * self.n_medium / self.wavelength
 
-        def scatter_i(i):
-            return self._scatter_one_particle(
-                incident,
-                self.radii[i],
-                self.n_particles[i],
-                self.positions_yx[i],
-                self.z_particles[i],
-            )
+        # Axial k-vector (for defocus phase)
+        kz_med = jnp.sqrt(jnp.maximum(k_med ** 2 - (2.0 * jnp.pi) ** 2 * f2, 0.0))
 
-        # vmap over particles
-        scattered_all = jax.vmap(scatter_i)(jnp.arange(n_particles))
-        # Sum over particles: scattered_all.u shape (n_particles, y, x, 3)
-        scattered_sum_u = jnp.sum(scattered_all.u, axis=0)
-        scattered_field = incident.replace(u=scattered_sum_u)
+        # Scattering angles at each pupil point
+        sin_theta = jnp.clip(self.wavelength * jnp.sqrt(f2), 0.0, 1.0)
+        theta_grid = jnp.arcsin(sin_theta)      # (ny, nx)
+        phi_grid = jnp.arctan2(FY, FX)          # (ny, nx)
 
-        # Reference field (Fresnel reflection)
-        ref_field = fresnel_reference(incident, self.n_glass, self.n_medium)
-        ref_field = ref_field.replace(u=ref_field.u * self.reference_amplitude)
+        # ── Per-particle pupil contribution ───────────────────────────────────
+        def pupil_one(i):
+            radius = self.radii[i]
+            m = self.n_particles[i]
+            dy = self.positions_yx[i, 0]
+            dx_p = self.positions_yx[i, 1]
+            z_p = self.z_particles[i]
 
-        # Total field = reference + scattered
-        total_u = ref_field.u + scattered_field.u
-        total_field = incident.replace(u=total_u)
+            x_size = k_med * radius
 
-        # Optional background
+            if self.scattering_model == "mie":
+                n_max_use = self.n_max if self.n_max is not None else 20
+                a_n, b_n = mie_coefficients(m, x_size, n_max_use)
+                s1, s2 = s1_s2(theta_grid, a_n, b_n)
+                # x-polarised: S = S2 cos²φ + S1 sin²φ
+                S = s2 * jnp.cos(phi_grid) ** 2 + s1 * jnp.sin(phi_grid) ** 2
+            else:
+                # Isotropic Rayleigh: S = -i k³ α / (4π)
+                alpha = (4.0 * jnp.pi * radius ** 3
+                         * (m ** 2 - 1.0) / (m ** 2 + 2.0))
+                S = (-1j * k_med ** 3 * alpha / (4.0 * jnp.pi)
+                     * jnp.ones((ny, nx), dtype=jnp.complex64))
+
+            # Defocus phase: particle at z_p, focus at z_focal
+            dz = z_p - self.z_focal
+            defocus_phase = jnp.exp(1j * kz_med * dz)
+
+            # Lateral position → phase ramp (FT shift theorem)
+            pos_phase = jnp.exp(-2j * jnp.pi * (FY * dy + FX * dx_p))
+
+            return S * na_mask * defocus_phase * pos_phase  # (ny, nx)
+
+        n_part = self.radii.shape[0]
+        all_pupils = jax.vmap(pupil_one)(jnp.arange(n_part))
+        pupil_total = jnp.sum(all_pupils, axis=0)  # (ny, nx)
+
+        # ── IFFT: pupil plane → image plane ───────────────────────────────────
+        # pupil_total has DC at centre → ifftshift → standard FFT ordering → ifft2
+        E_sc = jnp.fft.ifft2(jnp.fft.ifftshift(pupil_total))
+        # Undo 1/(ny*nx) normalisation so amplitude scales with pupil fill
+        E_sc = E_sc * (ny * nx)
+
+        # ── Fresnel reference (uniform, normal incidence) ─────────────────────
+        r_fresnel = ((self.n_medium - self.n_glass)
+                     / (self.n_medium + self.n_glass))
+        E_ref_scalar = r_fresnel * self.reference_amplitude
+
         if include_background and key is not None:
-            bg = psd_background_phase(key, shape, dx)
-            total_field = total_field.replace(u=total_field.u * bg)
+            bg = psd_background_phase(key, shape, dx)[..., 0]  # (ny, nx)
+            E_ref_field = E_ref_scalar * bg
+        else:
+            E_ref_field = E_ref_scalar * jnp.ones((ny, nx), dtype=jnp.complex64)
 
-        # Intensity
-        intensity = jnp.sum(jnp.abs(total_field.u) ** 2, axis=-1)  # (y, x)
+        # ── Intensity ──────────────────────────────────────────────────────────
+        E_total = E_ref_field + E_sc
+        intensity = jnp.abs(E_total) ** 2
 
-        # Apply sensor if provided
         if self.sensor is not None:
             intensity = self.sensor(intensity)
 
@@ -199,13 +182,7 @@ class iSCATMicroscope(eqx.Module):
 def simulate_z_stack(microscope: iSCATMicroscope, z_focal_values, **kwargs):
     """Simulate a z-stack by vmapping over focal positions.
 
-    Args:
-        microscope: iSCATMicroscope instance
-        z_focal_values: 1D array of focal depths to simulate
-        **kwargs: passed to microscope.__call__
-
-    Returns:
-        intensity stack of shape (nz, y, x)
+    Returns intensity stack of shape (nz, ny, nx).
     """
     def sim_at_z(z):
         m = eqx.tree_at(lambda mc: mc.z_focal, microscope, z)
